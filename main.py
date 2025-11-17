@@ -1,93 +1,101 @@
 import os
+import uuid
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_pinecone import PineconeVectorStore
+from langchain_community.vectorstores import FAISS
+from langchain_classic.chains import create_retrieval_chain
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import Runnable, RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
+import tempfile
 
 # Load environment variables
 load_dotenv()
 
-# --- Global State (Initialized during lifespan) ---
-app_state = {}
+# --- Global State & RAG Logic ---
+app_state = {"sessions": {}}
 
-def initialize_rag_chain():
-    """Initializes and returns the RAG chain and retriever."""
-    print("Initializing RAG chain...")
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    index_name = os.getenv("PINECONE_INDEX_NAME", "rag-index")
-    vector_store = PineconeVectorStore(
-        index_name=index_name,
-        embedding=embeddings,
-        pinecone_api_key=os.getenv("PINECONE_API_KEY")
-    )
-    llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
-    retriever = vector_store.as_retriever(search_kwargs={"k": 5})
-    template = """You are a helpful assistant that answers questions based on provided context documents... Context: {context} Question: {question} Provide a single, well-synthesized answer..."""
-    prompt = ChatPromptTemplate.from_template(template)
+def process_document(file_path: str, page_limit: int = 200):
+    """Loads, validates, and creates a RAG chain from a PDF."""
+    loader = PyPDFLoader(file_path)
+    pages = loader.load_and_split()
     
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
+    if len(pages) > page_limit:
+        raise ValueError(f"Document exceeds the {page_limit}-page limit.")
         
-    rag_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = text_splitter.split_documents(pages)
+    
+    embeddings = OpenAIEmbeddings()
+    vector_store = FAISS.from_documents(chunks, embeddings)
+    retriever = vector_store.as_retriever()
+    
+    llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
+    
+    # Create prompt template using ChatPromptTemplate
+    prompt = ChatPromptTemplate.from_template(
+        "Context: {context}\nQuestion: {question}\nAnswer:"
     )
-    print("RAG chain initialized successfully!")
-    return rag_chain, retriever
+    
+    # Create the question-answering chain
+    question_answer_chain = create_stuff_documents_chain(llm, prompt)
+    
+    # Create the retrieval chain
+    chain = create_retrieval_chain(retriever, question_answer_chain)
+    
+    # Wrap it to maintain compatibility with the old RetrievalQA interface
+    class RetrievalQAWrapper:
+        def __init__(self, chain, retriever):
+            self.chain = chain
+            self.retriever = retriever
+        
+        def __call__(self, query_dict):
+            # The new chain expects {"input": ...} and returns {"answer": ..., "context": ...}
+            result = self.chain.invoke({"input": query_dict["query"]})
+            
+            # Get source documents from retriever
+            source_docs = self.retriever.invoke(query_dict["query"])
+            
+            # Return in the old format
+            return {
+                "result": result["answer"],
+                "source_documents": source_docs
+            }
+    
+    return RetrievalQAWrapper(chain, retriever)
 
-# This function will now be our dependency
-def get_rag_initializer():
-    """This function is a dependency that returns the real initializer."""
-    return initialize_rag_chain
-
+# --- FastAPI App Setup ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Initialize RAG chain and store in app_state
-    initializer = get_rag_initializer()
-    rag_chain, retriever = initializer()
-    app_state["rag_chain"] = rag_chain
-    app_state["retriever"] = retriever
+    # No model loading on startup anymore
+    print("API is starting up.")
     yield
-    # Shutdown: Clear state
+    # Cleanup on shutdown
     app_state.clear()
+    print("API is shutting down.")
 
-# --- Dependency Getters ---
-def get_rag_chain() -> Runnable:
-    return app_state["rag_chain"]
-
-def get_retriever():
-    return app_state["retriever"]
-
-# Initialize FastAPI app with lifespan
 app = FastAPI(
-    title="RAG Q&A API",
-    description="A Retrieval-Augmented Generation API...",
-    version="1.0.0",
+    title="Dynamic RAG Q&A API",
     lifespan=lifespan
 )
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- Pydantic Models ---
+class UploadResponse(BaseModel):
+    session_id: str
+    message: str
+
 class QuestionRequest(BaseModel):
+    session_id: str
     question: str
 
 class SourceDocument(BaseModel):
-    content_preview: str
+    page_content: str
     source: str
 
 class AnswerResponse(BaseModel):
@@ -95,39 +103,58 @@ class AnswerResponse(BaseModel):
     sources: list[SourceDocument]
 
 # --- API Endpoints ---
-@app.get("/")
-async def root():
-    return {"message": "RAG Q&A API is running", "status": "healthy", "docs": "/docs"}
-
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
-@app.post("/ask", response_model=AnswerResponse)
-async def ask_question(
-    request: QuestionRequest,
-    rag_chain: Runnable = Depends(get_rag_chain),
-    retriever = Depends(get_retriever)
-):
-    if not request.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
+@app.post("/upload", response_model=UploadResponse)
+async def upload_document(file: UploadFile = File(...)):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
     
     try:
-        source_docs = retriever.invoke(request.question)
-        answer = rag_chain.invoke(request.question)
+        # Save uploaded file to a temporary path
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            content = await file.read()
+            tmp_file.write(content)
+            tmp_file_path = tmp_file.name
+
+        # Process the document and create the RAG chain
+        rag_chain = process_document(tmp_file_path)
+        
+        # Clean up the temporary file
+        os.remove(tmp_file_path)
+        
+        # Create a unique session ID and store the chain
+        session_id = str(uuid.uuid4())
+        app_state["sessions"][session_id] = rag_chain
+        
+        return UploadResponse(session_id=session_id, message="Document processed successfully.")
+
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
+
+
+@app.post("/ask", response_model=AnswerResponse)
+async def ask_question(request: QuestionRequest):
+    if request.session_id not in app_state["sessions"]:
+        raise HTTPException(status_code=404, detail="Session not found. Please upload a document first.")
+    
+    rag_chain = app_state["sessions"][request.session_id]
+    
+    try:
+        result = rag_chain({"query": request.question})
         
         sources = [
             SourceDocument(
-                content_preview=doc.page_content[:200] + "...",
-                source=doc.metadata.get('source', 'Unknown')
-            ) for doc in source_docs
+                page_content=doc.page_content,
+                source=doc.metadata.get("source")
+            ) for doc in result["source_documents"]
         ]
         
-        return AnswerResponse(answer=answer, sources=sources)
+        return AnswerResponse(answer=result["result"], sources=sources)
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        raise HTTPException(status_code=500, detail=f"Error during query: {str(e)}")

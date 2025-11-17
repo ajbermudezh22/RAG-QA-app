@@ -56,11 +56,8 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     
     # API URL input
-    api_url = st.text_input(
-        "API URL",
-        value=os.getenv("API_URL", "http://localhost:8000"),
-        help="The URL of your FastAPI backend"
-    )
+    api_url = "https://rag-api-service-ajbermudezh22.onrender.com"
+    st.markdown(f"✅ Connected to API: `{api_url}`")
     
     st.markdown("---")
     st.markdown("### 📖 About")
